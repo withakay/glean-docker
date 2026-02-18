@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# gleanctl -- CLI for managing a local Glean code intelligence server
+# https://github.com/withakay/glean-docker
+set -euo pipefail
+
+VERSION="0.1.0"
+CONTAINER_NAME="${GLEANCTL_CONTAINER:-glean-server}"
+IMAGE="${GLEANCTL_IMAGE:-ghcr.io/withakay/glean-docker/rust:latest}"
+PORT="${GLEANCTL_PORT:-12345}"
+VOLUME="${GLEANCTL_VOLUME:-glean-data}"
+
+# ─── Helpers ──────────────────────────────────────────────────────────
+
+die()  { printf "error: %s\n" "$*" >&2; exit 1; }
+info() { printf ":: %s\n" "$*"; }
+warn() { printf "warning: %s\n" "$*" >&2; }
+
+container_running() {
+    docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -q true
+}
+
+container_exists() {
+    docker inspect "$CONTAINER_NAME" &>/dev/null
+}
+
+ensure_running() {
+    if ! container_running; then
+        die "Glean server is not running. Start it with: gleanctl start"
+    fi
+}
+
+# Resolve a path to absolute
+abs_path() {
+    local p="$1"
+    if [ -d "$p" ]; then
+        (cd "$p" && pwd)
+    elif [ -f "$p" ]; then
+        local dir
+        dir="$(cd "$(dirname "$p")" && pwd)"
+        echo "${dir}/$(basename "$p")"
+    else
+        # Doesn't exist yet, resolve parent
+        local dir
+        dir="$(cd "$(dirname "$p")" && pwd)"
+        echo "${dir}/$(basename "$p")"
+    fi
+}
+
+# Infer a database name from a project path
+infer_db_name() {
+    local src_path="$1"
+    # Use the directory name, lowercased, with special chars replaced
+    basename "$src_path" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]-' '-' | sed 's/-*$//'
+}
+
+# Detect language from project files
+detect_language() {
+    local src_path="$1"
+    if [ -f "${src_path}/Cargo.toml" ]; then
+        echo "rust"
+    elif [ -f "${src_path}/go.mod" ]; then
+        echo "go"
+    elif [ -f "${src_path}/package.json" ]; then
+        echo "typescript"
+    elif [ -f "${src_path}/setup.py" ] || [ -f "${src_path}/pyproject.toml" ]; then
+        echo "python"
+    elif [ -f "${src_path}/.csproj" ] || find "$src_path" -maxdepth 2 -name '*.csproj' -print -quit 2>/dev/null | grep -q .; then
+        echo "dotnet"
+    elif [ -f "${src_path}/CMakeLists.txt" ] || [ -f "${src_path}/Makefile" ]; then
+        echo "cpp"
+    else
+        echo "unknown"
+    fi
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────
+
+cmd_start() {
+    if container_running; then
+        info "Glean server is already running (container: $CONTAINER_NAME)"
+        return 0
+    fi
+
+    if container_exists; then
+        info "Starting existing container..."
+        docker start "$CONTAINER_NAME" >/dev/null
+    else
+        info "Creating and starting Glean server..."
+        docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            -p "127.0.0.1:${PORT}:12345" \
+            -v "${VOLUME}:/data/glean-db" \
+            "$IMAGE" \
+            server
+    fi
+
+    # Wait for server to be ready
+    local retries=20
+    while [ $retries -gt 0 ]; do
+        if docker exec "$CONTAINER_NAME" glean list --service "localhost:12345" &>/dev/null; then
+            info "Glean server is ready on port $PORT"
+            return 0
+        fi
+        retries=$((retries - 1))
+        sleep 0.5
+    done
+
+    warn "Server started but may not be ready yet. Check: gleanctl status"
+}
+
+cmd_stop() {
+    if ! container_exists; then
+        info "No Glean server container found"
+        return 0
+    fi
+    info "Stopping Glean server..."
+    docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    info "Stopped"
+}
+
+cmd_restart() {
+    cmd_stop
+    sleep 1
+    cmd_start
+}
+
+cmd_destroy() {
+    cmd_stop
+    if container_exists; then
+        info "Removing container..."
+        docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
+
+    local remove_volume=false
+    if [ "${1:-}" = "--all" ]; then
+        remove_volume=true
+    fi
+
+    if $remove_volume; then
+        info "Removing database volume..."
+        docker volume rm "$VOLUME" 2>/dev/null || true
+        info "All data removed"
+    else
+        info "Container removed. Database volume '$VOLUME' preserved."
+        info "To remove everything: gleanctl destroy --all"
+    fi
+}
+
+cmd_status() {
+    printf "Container:  %s\n" "$CONTAINER_NAME"
+    printf "Image:      %s\n" "$IMAGE"
+    printf "Port:       %s\n" "$PORT"
+    printf "Volume:     %s\n" "$VOLUME"
+    printf "\n"
+
+    if ! container_exists; then
+        printf "Status:     not created\n"
+        return 0
+    fi
+
+    local state
+    state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")
+    printf "Status:     %s\n" "$state"
+
+    if [ "$state" = "running" ]; then
+        local uptime
+        uptime=$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER_NAME" 2>/dev/null || echo "?")
+        printf "Started:    %s\n" "$uptime"
+        printf "\n"
+
+        # List databases
+        printf "Databases:\n"
+        local db_list
+        db_list=$(docker exec "$CONTAINER_NAME" glean list --service "localhost:12345" 2>/dev/null || echo "")
+        if [ -z "$db_list" ]; then
+            printf "  (none)\n"
+        else
+            echo "$db_list" | sed 's/^/  /'
+        fi
+    fi
+}
+
+cmd_index() {
+    ensure_running
+
+    local src_path=""
+    local db_name=""
+    local lang=""
+    local mode=""
+
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --db)       db_name="$2"; shift 2 ;;
+            --lang)     lang="$2"; shift 2 ;;
+            --mode)     mode="$2"; shift 2 ;;
+            -h|--help)  usage_index; exit 0 ;;
+            -*)         die "Unknown flag: $1" ;;
+            *)          src_path="$1"; shift ;;
+        esac
+    done
+
+    # Default to current directory
+    src_path="${src_path:-.}"
+    src_path="$(abs_path "$src_path")"
+
+    # Infer DB name from directory if not provided
+    if [ -z "$db_name" ]; then
+        db_name="$(infer_db_name "$src_path")"
+    fi
+
+    # Detect language if not specified
+    if [ -z "$lang" ]; then
+        lang="$(detect_language "$src_path")"
+    fi
+
+    # Set index mode based on language
+    if [ -z "$mode" ]; then
+        case "$lang" in
+            rust)       mode="lsif" ;;
+            *)          mode="lsif" ;;
+        esac
+    fi
+
+    info "Indexing $src_path as '$db_name' (language: $lang, mode: $mode)"
+
+    docker exec -i \
+        -e "GLEAN_DB_NAME=$db_name" \
+        -e "GLEAN_SRC_ROOT=/src" \
+        -e "GLEAN_INDEX_MODE=$mode" \
+        -e "GLEAN_SERVICE=localhost:12345" \
+        "$CONTAINER_NAME" \
+        sh -c "echo 'Cannot index via exec with source mount. Use run instead.'" >/dev/null 2>&1 || true
+
+    # We need to mount the source directory, so use docker run (not exec)
+    # connecting to the server via the shared network
+    docker run --rm -i \
+        --network "container:${CONTAINER_NAME}" \
+        -v "${src_path}:/src:ro" \
+        -v "${VOLUME}:/data/glean-db" \
+        -e "GLEAN_DB_NAME=$db_name" \
+        -e "GLEAN_SRC_ROOT=/src" \
+        -e "GLEAN_INDEX_MODE=$mode" \
+        -e "GLEAN_SERVICE=localhost:12345" \
+        "$IMAGE" \
+        index "$db_name"
+}
+
+cmd_query() {
+    ensure_running
+
+    local db_name="${1:?Usage: gleanctl query DB_NAME 'ANGLE_QUERY' [--limit N]}"
+    shift
+    local query="${1:?Usage: gleanctl query DB_NAME 'ANGLE_QUERY' [--limit N]}"
+    shift
+
+    docker exec -i "$CONTAINER_NAME" \
+        glean query --service "localhost:12345" --db "$db_name" "$@" "$query"
+}
+
+cmd_shell() {
+    ensure_running
+
+    local db_flag=()
+    if [ -n "${1:-}" ]; then
+        db_flag=(-e ":db $1")
+    fi
+
+    docker exec -it "$CONTAINER_NAME" \
+        glean shell --service "localhost:12345" "${db_flag[@]}"
+}
+
+cmd_lsp() {
+    ensure_running
+
+    local db_name="${1:?Usage: gleanctl lsp DB_NAME}"
+
+    # LSP runs over stdio, so we need -i (no -t)
+    docker exec -i \
+        -e "GLEAN_SERVICE=localhost:12345" \
+        "$CONTAINER_NAME" \
+        glean-lsp --service "localhost:12345" --repo "$db_name"
+}
+
+cmd_db_list() {
+    ensure_running
+    docker exec "$CONTAINER_NAME" \
+        glean list --service "localhost:12345" 2>/dev/null
+}
+
+cmd_db_delete() {
+    ensure_running
+    local db="${1:?Usage: gleanctl db delete DB_NAME[/INSTANCE]}"
+
+    # Add default instance if not specified
+    if [[ "$db" != */* ]]; then
+        db="${db}/1"
+    fi
+
+    docker exec "$CONTAINER_NAME" \
+        glean delete --service "localhost:12345" --db "$db"
+    info "Deleted database: $db"
+}
+
+cmd_db_stats() {
+    ensure_running
+    local db="${1:?Usage: gleanctl db stats DB_NAME}"
+
+    # Add default instance if not specified
+    if [[ "$db" != */* ]]; then
+        db="${db}/1"
+    fi
+
+    docker exec "$CONTAINER_NAME" \
+        glean stats --service "localhost:12345" --db "$db"
+}
+
+cmd_logs() {
+    local follow=""
+    if [ "${1:-}" = "-f" ] || [ "${1:-}" = "--follow" ]; then
+        follow="-f"
+    fi
+    docker logs $follow "$CONTAINER_NAME" 2>&1
+}
+
+cmd_install() {
+    local install_dir="${1:-${HOME}/.local/bin}"
+    local script_path
+    script_path="$(abs_path "$0")"
+
+    mkdir -p "$install_dir"
+
+    if [ "$(abs_path "${install_dir}/gleanctl")" = "$script_path" ]; then
+        info "Already installed at $install_dir/gleanctl"
+        return 0
+    fi
+
+    cp "$script_path" "${install_dir}/gleanctl"
+    chmod +x "${install_dir}/gleanctl"
+    info "Installed gleanctl to ${install_dir}/gleanctl"
+
+    # Check if install_dir is in PATH
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
+        warn "$install_dir is not in your PATH"
+        printf "  Add it with: export PATH=\"%s:\$PATH\"\n" "$install_dir"
+    fi
+}
+
+cmd_pull() {
+    info "Pulling latest image: $IMAGE"
+    docker pull "$IMAGE"
+}
+
+cmd_version() {
+    printf "gleanctl %s\n" "$VERSION"
+    printf "image:     %s\n" "$IMAGE"
+    if container_running; then
+        local glean_ver
+        glean_ver=$(docker exec "$CONTAINER_NAME" glean --help 2>&1 | head -1 || echo "unknown")
+        printf "glean:     %s\n" "$glean_ver"
+    fi
+}
+
+# ─── Usage ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'EOF'
+gleanctl -- manage a local Glean code intelligence server
+
+USAGE
+    gleanctl <command> [options]
+
+SERVER
+    start               Start the Glean server container
+    stop                Stop the server
+    restart             Restart the server
+    destroy [--all]     Remove container (--all removes data volume too)
+    status              Show server status and indexed databases
+    logs [-f]           View server logs (-f to follow)
+    pull                Pull the latest Docker image
+
+INDEXING
+    index [PATH] [--db NAME] [--lang LANG] [--mode MODE]
+                        Index a codebase (defaults to current directory)
+                        --db     Database name (default: directory name)
+                        --lang   Language hint (auto-detected from project files)
+                        --mode   Index mode: lsif or scip (default: lsif)
+
+QUERYING
+    query DB 'QUERY'    Run an Angle query against a database
+    shell [DB]          Interactive Angle query shell
+
+LSP
+    lsp DB              Start LSP server for a database (over stdio)
+
+DATABASE
+    db list             List all databases
+    db delete DB        Delete a database
+    db stats DB         Show database statistics
+
+SETUP
+    install [DIR]       Install gleanctl to DIR (default: ~/.local/bin)
+    version             Show version info
+
+ENVIRONMENT
+    GLEANCTL_CONTAINER  Container name (default: glean-server)
+    GLEANCTL_IMAGE      Docker image (default: ghcr.io/withakay/glean-docker/rust:latest)
+    GLEANCTL_PORT       Host port (default: 12345)
+    GLEANCTL_VOLUME     Docker volume name (default: glean-data)
+
+EXAMPLES
+    gleanctl start                          # Start the server
+    gleanctl index ~/projects/myapp         # Index a project
+    gleanctl index . --db my-api            # Index current dir with custom name
+    gleanctl db list                        # List indexed databases
+    gleanctl query myapp 'src.File _'       # Find all indexed files
+    gleanctl shell myapp                    # Interactive query shell
+    gleanctl lsp myapp                      # Start LSP for editor integration
+EOF
+}
+
+usage_index() {
+    cat <<'EOF'
+gleanctl index -- index a codebase into Glean
+
+USAGE
+    gleanctl index [PATH] [--db NAME] [--lang LANG] [--mode MODE]
+
+ARGUMENTS
+    PATH        Path to source code (default: current directory)
+    --db        Database name (default: inferred from directory name)
+    --lang      Language: rust, go, typescript, python, dotnet, cpp
+                (default: auto-detected from project files)
+    --mode      Indexer mode: lsif or scip (default: lsif)
+
+EXAMPLES
+    gleanctl index                          # Index current directory
+    gleanctl index ~/projects/myapp         # Index a specific project
+    gleanctl index . --db api-server        # Custom database name
+    gleanctl index . --mode scip            # Use SCIP format
+EOF
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    start)      shift; cmd_start "$@" ;;
+    stop)       shift; cmd_stop "$@" ;;
+    restart)    shift; cmd_restart "$@" ;;
+    destroy)    shift; cmd_destroy "$@" ;;
+    status)     shift; cmd_status "$@" ;;
+    logs)       shift; cmd_logs "$@" ;;
+    pull)       shift; cmd_pull "$@" ;;
+    index)      shift; cmd_index "$@" ;;
+    query)      shift; cmd_query "$@" ;;
+    shell)      shift; cmd_shell "$@" ;;
+    lsp)        shift; cmd_lsp "$@" ;;
+    db)
+        shift
+        case "${1:-list}" in
+            list)   shift; cmd_db_list "$@" ;;
+            delete) shift; cmd_db_delete "$@" ;;
+            stats)  shift; cmd_db_stats "$@" ;;
+            *)      die "Unknown db command: $1. Use: list, delete, stats" ;;
+        esac
+        ;;
+    install)    shift; cmd_install "$@" ;;
+    version)    shift; cmd_version "$@" ;;
+    help|-h|--help) usage ;;
+    *)          die "Unknown command: $1. Run 'gleanctl help' for usage." ;;
+esac
