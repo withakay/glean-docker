@@ -91,8 +91,11 @@ cmd_start() {
             --restart unless-stopped \
             -p "127.0.0.1:${PORT}:12345" \
             -v "${VOLUME}:/data/glean-db" \
+            --entrypoint glean-server \
             "$IMAGE" \
-            server
+            --db-root /data/glean-db \
+            --schema /opt/glean/schema \
+            --port 12345
     fi
 
     # Wait for server to be ready
@@ -225,26 +228,34 @@ cmd_index() {
 
     info "Indexing $src_path as '$db_name' (language: $lang, mode: $mode)"
 
-    docker exec -i \
-        -e "GLEAN_DB_NAME=$db_name" \
-        -e "GLEAN_SRC_ROOT=/src" \
-        -e "GLEAN_INDEX_MODE=$mode" \
-        -e "GLEAN_SERVICE=localhost:12345" \
-        "$CONTAINER_NAME" \
-        sh -c "echo 'Cannot index via exec with source mount. Use run instead.'" >/dev/null 2>&1 || true
+    # Determine the glean index subcommand based on language and mode
+    local index_cmd
+    case "${lang}-${mode}" in
+        rust-scip)          index_cmd="rust-scip" ;;
+        rust-lsif|rust-*)   index_cmd="rust-lsif" ;;
+        *)                  index_cmd="rust-lsif" ;;
+    esac
 
-    # We need to mount the source directory, so use docker run (not exec)
-    # connecting to the server via the shared network
+    # Delete existing DB with the same name (via the server)
+    local existing
+    existing=$(docker exec "$CONTAINER_NAME" \
+        glean list --service "localhost:$PORT" 2>/dev/null | grep "^${db_name}/" || true)
+    if [ -n "$existing" ]; then
+        info "Removing existing database ${db_name}..."
+        docker exec "$CONTAINER_NAME" \
+            glean delete --service "localhost:$PORT" --db "${db_name}/1" 2>/dev/null || true
+    fi
+
+    # Index via docker run: mount source, connect to server over shared network
+    # Use --entrypoint to bypass container entrypoint and run glean directly
     docker run --rm -i \
         --network "container:${CONTAINER_NAME}" \
         -v "${src_path}:/src:ro" \
-        -v "${VOLUME}:/data/glean-db" \
-        -e "GLEAN_DB_NAME=$db_name" \
-        -e "GLEAN_SRC_ROOT=/src" \
-        -e "GLEAN_INDEX_MODE=$mode" \
-        -e "GLEAN_SERVICE=localhost:12345" \
+        --entrypoint glean \
         "$IMAGE" \
-        index "$db_name"
+        index "$index_cmd" /src \
+        --service "localhost:$PORT" \
+        --db "${db_name}/1"
 }
 
 cmd_query() {
@@ -255,8 +266,13 @@ cmd_query() {
     local query="${1:?Usage: gleanctl query DB_NAME 'ANGLE_QUERY' [--limit N]}"
     shift
 
+    # Append default instance if not specified
+    if [[ "$db_name" != */* ]]; then
+        db_name="${db_name}/1"
+    fi
+
     docker exec -i "$CONTAINER_NAME" \
-        glean query --service "localhost:12345" --db "$db_name" "$@" "$query"
+        glean query --service "localhost:$PORT" --db "$db_name" "$@" "$query"
 }
 
 cmd_shell() {
@@ -268,7 +284,7 @@ cmd_shell() {
     fi
 
     docker exec -it "$CONTAINER_NAME" \
-        glean shell --service "localhost:12345" "${db_flag[@]}"
+        glean shell --service "localhost:$PORT" "${db_flag[@]}"
 }
 
 cmd_lsp() {
@@ -280,13 +296,13 @@ cmd_lsp() {
     docker exec -i \
         -e "GLEAN_SERVICE=localhost:12345" \
         "$CONTAINER_NAME" \
-        glean-lsp --service "localhost:12345" --repo "$db_name"
+        glean-lsp --service "localhost:$PORT" --repo "$db_name"
 }
 
 cmd_db_list() {
     ensure_running
     docker exec "$CONTAINER_NAME" \
-        glean list --service "localhost:12345" 2>/dev/null
+        glean list --service "localhost:$PORT" 2>/dev/null
 }
 
 cmd_db_delete() {
@@ -299,7 +315,7 @@ cmd_db_delete() {
     fi
 
     docker exec "$CONTAINER_NAME" \
-        glean delete --service "localhost:12345" --db "$db"
+        glean delete --service "localhost:$PORT" --db "$db"
     info "Deleted database: $db"
 }
 
